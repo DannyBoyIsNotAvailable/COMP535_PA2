@@ -54,14 +54,14 @@ private static class PQEntry {
  * this will cover all the edges for all routers
  */
 
-// NOTE: linkStateID是自己的 linkID是对方的
+// NOTE: linkStateID-current router, 是自己的 linkID-target router, 是对方的
 private Map<String, Map<String, Integer>> constructGraph() {
   Map<String, Map<String, Integer>> graph = new HashMap<>();
   for (LSA lsa : _store.values()) { 
     Map<String, Integer> edges = new HashMap<>();
 
     for (LinkDescription ld : lsa.links) {
-      if (ld.linkID.equals(lsa.linkStateID)) continue; // 会存一个自连接
+      if (ld.linkID.equals(lsa.linkStateID)) continue; // self 会存一个自连接
       edges.put(ld.linkID, ld.weight);
     }
     graph.put(lsa.linkStateID, edges);
