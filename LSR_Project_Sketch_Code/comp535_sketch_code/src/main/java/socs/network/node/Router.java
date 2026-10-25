@@ -821,9 +821,10 @@ public class Router {
    */
   private void processDetect(String destinationIP) {
     String path = lsd.getShortestPath(destinationIP);
-    if (path == null) {System.out.println("Path not found");}
-    else {
-      System.out.println(path);
+    if (path == null) {
+      System.out.println("Path not found");
+    } else {
+      System.out.println("Path found: " + path);
     }
   }
 
@@ -878,11 +879,11 @@ public class Router {
    * <p/>
    * For each intermediate router on the shortest path (excluding the source and destination),
    * the router window should print:
-   * "Forwarding packet from <Source IP> to <Destination IP>"
+   * "Forwarding message from <Source IP> to <Destination IP>"
    * <p/>
    * When the destination router receives the message, the router window should print:
-   * "Received message from <Source IP>:"
-   * "<Message>"
+   * "Received message from <Source IP>;"
+   * "Message: <Message>"
    *
    * @param destinationIP the simulated IP address of the destination router
    * @param message the message content to send
@@ -891,8 +892,8 @@ public class Router {
     if (destinationIP.equals(rd.simulatedIPAddress)) {
       // EDGE CASE: local delivery needs no socket or network packet count.
       System.out.println("Sending message to " + destinationIP);
-      System.out.println("Received message from " + rd.simulatedIPAddress + ":");
-      System.out.println(message);
+      System.out.println("Received message from " + rd.simulatedIPAddress + ";");
+      System.out.println("Message: " + message);
       return;
     }
     Link link = nextHopLink(destinationIP);
@@ -911,11 +912,11 @@ public class Router {
    * This method should be called when a router receives a SOSPFPacket with sospfType = 2 (Application Message).
    * <p/>
    * If this router is the destination (packet.dstIP equals this router's simulatedIPAddress):
-   * - Print "Received message from <Source IP>:"
-   * - Print the message content
+   * - Print "Received message from <Source IP>;"
+   * - Print "Message: <Message>"
    * <p/>
    * If this router is an intermediate router:
-   * - Print "Forwarding packet from <Source IP> to <Destination IP>"
+   * - Print "Forwarding message from <Source IP> to <Destination IP>"
    * - Forward the packet to the next hop on the shortest path to the destination
    * - Do NOT print or inspect the message payload
    *
@@ -924,8 +925,8 @@ public class Router {
   private void handleApplicationMessage(socs.network.message.SOSPFPacket packet) {
     // router is the destination
     if (packet.dstIP.equals(rd.simulatedIPAddress)) {
-      System.out.println("Received message from " + packet.srcIP + ":");
-      System.out.println(packet.message);
+      System.out.println("Received message from " + packet.srcIP + ";");
+      System.out.println("Message: " + packet.message);
       return;
     }
 
@@ -935,7 +936,8 @@ public class Router {
       System.out.println("Path not found");
       return;
     }
-    System.out.println("Forwarding packet from " + packet.srcIP + " to " + packet.dstIP);
+    System.out.println("Forwarding message from " + packet.srcIP + " to " + packet.dstIP);
+    System.out.println("Next hop: " + nextLink.router2.simulatedIPAddress);
     // EDGE CASE: across multiple hops, preserve the original source and payload.
     // The intermediate router only uses dstIP to choose its next link.
     sendOneWayMessage(nextLink.router2, packet);
@@ -992,61 +994,96 @@ public class Router {
     }
   }
 
-  /** Parses one command line and runs the matching process* method. */
-  private void runCommand(String command) {
-    if (command.startsWith("detect ")) {
-      String[] cmdLine = command.split(" ");
-      processDetect(cmdLine[1]);
-    } else if (command.startsWith("disconnect ")) {
-      String[] cmdLine = command.split(" ");
-      processDisconnect(Short.parseShort(cmdLine[1]));
-    } else if (command.equals("quit")) {
-      processQuit();
-    } else if (command.equals("stats")) {
-      System.out.println(stats.reportMessageCount());
-    }else if (command.startsWith("attach ")) {
-      // attach [Process IP] [Process Port] [Simulated IP] [Link Weight]
-      String[] cmdLine = command.split(" ");
-      String processIP = cmdLine[1];
-      short processPort = Short.parseShort(cmdLine[2]);
-      String simulatedIP = cmdLine[3];
-      short weight = Short.parseShort(cmdLine[4]);
-      // Runs off the terminal thread: it blocks until the remote user answers Y/N, and this
-      // terminal must stay free to answer the remote router's own request in the meantime.
-      Thread attach = new Thread(
-          () -> processAttach(processIP, processPort, simulatedIP, weight),
-          "attach-" + simulatedIP);
-      attach.setDaemon(true);
-      attach.start();
-    } else if (command.equals("start")) {
-      processStart();
-    } else if (command.equals("lsd")) {
-      System.out.println(lsd);
-    }else if (command.startsWith("connect ")) {
-      String[] cmdLine = command.split(" ");
-      processConnect(cmdLine[1], Short.parseShort(cmdLine[2]),
-          cmdLine[3], Short.parseShort(cmdLine[4]));
-    } else if (command.equals("neighbors")) {
-      processNeighbors();
-    } else if (command.startsWith("send ")) {
-      // send [Destination IP] [Message]
-      String[] cmdLine = command.split(" ", 3);
-      if (cmdLine.length >= 3) {
-        processSend(cmdLine[1], cmdLine[2]);
-      } else {
-        System.out.println("Usage: send [Destination IP] [Message]");
-      }
-    } else if (command.startsWith("update ")) {
-      // update [port_number] [new_weight]
-      String[] cmdLine = command.split(" ");
-      if (cmdLine.length >= 3) {
-        processUpdate(Short.parseShort(cmdLine[1]), Short.parseShort(cmdLine[2]));
-      } else {
-        System.out.println("Usage: update [port_number] [new_weight]");
-      }
-    } else {
-      System.out.println("Unknown command: " + command);
+  private boolean hasArgumentCount(String[] arguments, int expected, String usage) {
+    if (arguments.length == expected) {
+      return true;
     }
+    System.out.println("Usage: " + usage);
+    return false;
   }
 
+  /** Parses one command line and runs the matching process* method. */
+  private void runCommand(String command) {
+    command = command.trim();
+    if (command.isEmpty()) {
+      return;
+    }
+    // EDGE CASE: consecutive spaces or tabs are valid command separators.
+    // Check argument counts before indexing; an incomplete command must not crash.
+    String[] arguments = command.split("\\s+");
+    switch (arguments[0]) {
+      case "detect":
+        if (hasArgumentCount(arguments, 2, "detect [Destination IP]")) {
+          processDetect(arguments[1]);
+        }
+        break;
+      case "disconnect":
+        if (hasArgumentCount(arguments, 2, "disconnect [Port Number]")) {
+          processDisconnect(Short.parseShort(arguments[1]));
+        }
+        break;
+      case "quit":
+        if (hasArgumentCount(arguments, 1, "quit")) {
+          processQuit();
+        }
+        break;
+      case "stats":
+        if (hasArgumentCount(arguments, 1, "stats")) {
+          System.out.println(stats.reportMessageCount());
+        }
+        break;
+      case "attach":
+        if (hasArgumentCount(arguments, 5,
+            "attach [Process IP] [Process Port] [Simulated IP] [Link Weight]")) {
+          String processIP = arguments[1];
+          short processPort = Short.parseShort(arguments[2]);
+          String simulatedIP = arguments[3];
+          short weight = Short.parseShort(arguments[4]);
+          // Human approval must not block this terminal from handling incoming Y/N.
+          Thread attach = new Thread(
+              () -> processAttach(processIP, processPort, simulatedIP, weight),
+              "attach-" + simulatedIP);
+          attach.setDaemon(true);
+          attach.start();
+        }
+        break;
+      case "start":
+        if (hasArgumentCount(arguments, 1, "start")) {
+          processStart();
+        }
+        break;
+      case "lsd":
+        if (hasArgumentCount(arguments, 1, "lsd")) {
+          System.out.println(lsd);
+        }
+        break;
+      case "connect":
+        if (hasArgumentCount(arguments, 5,
+            "connect [Process IP] [Process Port] [Simulated IP] [Link Weight]")) {
+          processConnect(arguments[1], Short.parseShort(arguments[2]),
+              arguments[3], Short.parseShort(arguments[4]));
+        }
+        break;
+      case "neighbors":
+        if (hasArgumentCount(arguments, 1, "neighbors")) {
+          processNeighbors();
+        }
+        break;
+      case "send":
+        // EDGE CASE: tokenize only the command and destination; preserve spaces
+        // and tabs inside the application payload rather than rebuilding the text.
+        String[] messageArguments = command.split("\\s+", 3);
+        if (hasArgumentCount(messageArguments, 3, "send [Destination IP] [Message]")) {
+          processSend(messageArguments[1], messageArguments[2]);
+        }
+        break;
+      case "update":
+        if (hasArgumentCount(arguments, 3, "update [Port Number] [New Weight]")) {
+          processUpdate(Short.parseShort(arguments[1]), Short.parseShort(arguments[2]));
+        }
+        break;
+      default:
+        System.out.println("Unknown command: " + command);
+    }
+  }
 }
