@@ -104,13 +104,4 @@ Repeat `start`, `detect`, `send`, and `stats` without restarting the processes. 
 - LSDB snapshots and accepted/forwarded updates are deep copies. Database access, link slots and statistics have separate synchronization.
 - Network connections and reads use a 5000 ms timeout before object-stream input is constructed. An outgoing attach deliberately waits without a read deadline while the remote user decides Y/N.
 - Edge-case comments are marked `EDGE CASE` in the source. Link slot zero and zero-cost edges are valid. Negative costs are rejected. Unknown paths, local delivery, repeated handshakes and concurrent database access are handled explicitly.
-- This PA2 version does not implement background failure detection, full topology withdrawal on peer exit, or sequence-number recovery after process restarts.
 
-## Collaboration and AI assistance
-
-Contributors are identified here by their GitHub handles:
-
-- **RaayZhang:** maintains the shared upstream PA2 baseline at `RaayZhang/COMP535_PA2`, from which this version was forked.
-- **DannyBoyIsNotAvailable:** integrates the PA2 fixes and documentation in this fork, runs local manual validation, and prepares changes to return to the shared repository.
-
-The repository and fork provide the shared baseline and version history; changes are exchanged through GitHub commits and pull requests. AI assistance was used to review and implement edge-case fixes, prepare internal checks, and draft documentation. The automated build and internal checks do not replace the group members' local multi-router tests.
