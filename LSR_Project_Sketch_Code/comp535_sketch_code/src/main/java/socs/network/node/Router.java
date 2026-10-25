@@ -10,6 +10,7 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -268,12 +269,27 @@ public class Router {
     return out;
   }
 
+  private static Socket openSocket(String processIP, short processPort) throws IOException {
+    Socket socket = new Socket();
+    try {
+      // EDGE CASE: bound connection setup and reads, including the stream header.
+      // Setting SO_TIMEOUT after constructing ObjectInputStream is too late.
+      socket.connect(new InetSocketAddress(processIP, processPort), HELLO_TIMEOUT_MS);
+      socket.setSoTimeout(HELLO_TIMEOUT_MS);
+      return socket;
+    } catch (IOException | IllegalArgumentException e) {
+      socket.close();
+      throw e;
+    }
+  }
+
   /** Reads one SOSPFPacket; anything else on the wire is treated as an I/O error. */
   private static SOSPFPacket readPacket(ObjectInputStream in)
       throws IOException, ClassNotFoundException {
     Object received = in.readObject();
     if (!(received instanceof SOSPFPacket)) {
-      throw new IOException("unexpected object on the wire: " + received.getClass().getName());
+      throw new IOException("unexpected object on the wire: "
+          + (received == null ? "null" : received.getClass().getName()));
     }
     return (SOSPFPacket) received;
   }
@@ -281,8 +297,11 @@ public class Router {
   //---------------------------PA2 new helper method--------------------
 
   private boolean isTwoWay(Link link) {
-    return link.router1.status == RouterStatus.TWO_WAY &&
-     link.router2.status == RouterStatus.TWO_WAY; 
+    synchronized (portLock) {
+      // EDGE CASE: router1 is shared local rd; HELLO only advances router2.status
+      // for this neighbor. Checking router1 would reject every valid link.
+      return link != null && link.router2.status == RouterStatus.TWO_WAY;
+    }
   }
 
   private int getPort(Link link) {
@@ -297,10 +316,15 @@ public class Router {
   }
 
   private boolean addNeighborToLSA(Link link) {
-    if (isTwoWay(link) && getPort(link) > 0) {
-      return this.lsd.addLinkToLSA(link.router2.simulatedIPAddress, getPort(link), link.weight);
+    synchronized (portLock) {
+      int port = getPort(link);
+      // EDGE CASE: port 0 is valid; -1 means the link is no longer installed.
+      // Keep the checks and insertion together during concurrent start commands.
+      if (isTwoWay(link) && port >= 0) {
+        return lsd.addLinkToLSA(link.router2.simulatedIPAddress, port, link.weight);
+      }
+      return false;
     }
-    return false;
   }
 
 
@@ -309,17 +333,15 @@ public class Router {
    * Don't need to wait for peer's reply
    */
   private boolean sendOneWayMessage(RouterDescription neighbor, SOSPFPacket packet) {
-    try (Socket socket = new Socket(neighbor.processIPAddress, neighbor.processPortNumber);
-  ObjectOutputStream out = openOutput(socket)) {
-    socket.setSoTimeout(HELLO_TIMEOUT_MS); // set time limit for 5 sec
-    ObjectInputStream input = new ObjectInputStream(socket.getInputStream());
-    out.writeObject(packet);
-    out.flush();
-    // packet.sospftype's indx has the same order as we define in MessageCOunt
-    // here the type can be different <----------- +1
-    stats.countSent(packet.sospfType);
-
-    return true;
+    try (Socket socket = openSocket(neighbor.processIPAddress, neighbor.processPortNumber);
+         ObjectOutputStream out = openOutput(socket);
+         ObjectInputStream peerInput = new ObjectInputStream(socket.getInputStream())) {
+      // Reading the peer's stream header ensures it opened its output before we
+      // close. No packet reply is expected; try-with-resources closes both streams.
+      out.writeObject(packet);
+      out.flush();
+      stats.countSent(packet.sospfType);
+      return true;
     } catch (IOException e) {
       System.out.println("Cannot send to " + neighbor.simulatedIPAddress + ": " + e.getMessage());
       return false;
@@ -334,7 +356,8 @@ public class Router {
   private void broadcastLSAUpdate(Vector<LSA> LSAs, String exception) {
     for (Link link : snapshotLinks()) {
       RouterDescription neighbor = link.router2;
-      if (!isTwoWay(link) || exception.equals(neighbor.simulatedIPAddress)) {
+      // EDGE CASE: locally originated broadcasts have exception == null.
+      if (!isTwoWay(link) || neighbor.simulatedIPAddress.equals(exception)) {
         continue;
       }
       SOSPFPacket packet = newPacket(TYPE_LSU, neighbor.simulatedIPAddress);
@@ -364,7 +387,9 @@ public class Router {
 
   private Link nextHopLink(String destinationIP) {
     Path path = lsd.findShortestPathTo(destinationIP);
-    if (path.nextHop() == null || path.nextHop() == null) {
+    // EDGE CASE: an unreachable destination has no Path; a path to this router
+    // exists but has no next hop. Neither should dereference null.
+    if (path == null || path.nextHop() == null) {
       return null;
     }
     Link link = findLink(path.nextHop());
@@ -404,28 +429,30 @@ public class Router {
 
   /** Reads the first packet of a connection and dispatches on its type. */
   private void connectionHandler(Socket socket) {
-    try (Socket s = socket;
-         ObjectOutputStream out = openOutput(s);
-         ObjectInputStream in = new ObjectInputStream(s.getInputStream())) {
+    try (Socket s = socket) {
+      s.setSoTimeout(HELLO_TIMEOUT_MS);
+      try (ObjectOutputStream out = openOutput(s);
+           ObjectInputStream in = new ObjectInputStream(s.getInputStream())) {
 
-      SOSPFPacket packet = readPacket(in);
-      stats.countReceived(packet.sospfType);
-      switch (packet.sospfType) {
-        case TYPE_ATTACH:
-          handleAttachRequest(packet, out);
-          break;
-        case TYPE_HELLO:
-          handleHello(packet, s, in, out);
-          break;
-        case TYPE_LSU:
-          receiveLSAUpdate(packet); // step1: merge update step2: broadcast update
-          break;
-        case TYPE_APP_MESSAGE:
-          handleApplicationMessage(packet);
-          break;
-        default:
-          System.out.println("received unsupported packet type " + packet.sospfType
-              + " from " + packet.srcIP + ";");
+        SOSPFPacket packet = readPacket(in);
+        stats.countReceived(packet.sospfType);
+        switch (packet.sospfType) {
+          case TYPE_ATTACH:
+            handleAttachRequest(packet, out);
+            break;
+          case TYPE_HELLO:
+            handleHello(packet, s, in, out);
+            break;
+          case TYPE_LSU:
+            receiveLSAUpdate(packet); // step1: merge update step2: broadcast update
+            break;
+          case TYPE_APP_MESSAGE:
+            handleApplicationMessage(packet);
+            break;
+          default:
+            System.out.println("received unsupported packet type " + packet.sospfType
+                + " from " + packet.srcIP + ";");
+        }
       }
     } catch (IOException | ClassNotFoundException e) {
       System.out.println("connection error: " + e.getMessage());
@@ -446,6 +473,12 @@ public class Router {
 
   private void processAttach(String processIP, short processPort,
                              String simulatedIP, short weight) {
+    // EDGE CASE: Dijkstra needs nonnegative weights. Validate before reserving
+    // a port or sending a request; zero-cost links remain valid.
+    if (weight < 0 || processPort <= 0) {
+      System.out.println("Cannot attach: weight must be nonnegative and process port positive.");
+      return;
+    }
     if (rd.simulatedIPAddress.equals(simulatedIP)) {
       System.out.println("Cannot attach to yourself.");
       return;
@@ -469,7 +502,7 @@ public class Router {
         return;
       }
 
-      try (Socket socket = new Socket(processIP, processPort);
+      try (Socket socket = openSocket(processIP, processPort);
            ObjectOutputStream out = openOutput(socket);
            ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
 
@@ -480,9 +513,18 @@ public class Router {
         stats.countSent(TYPE_ATTACH);  // count the TYPE_ATTACH
 
 
+        // EDGE CASE: human approval can take longer than HELLO_TIMEOUT_MS.
+        // Connection/header reads are bounded, but the Y/N wait is deliberate.
+        socket.setSoTimeout(0);
+
         // Blocks until the remote user has typed Y or N.
         SOSPFPacket reply = readPacket(in);
-        stats.countReceived(TYPE_ATTACH); // 这里可以发来其他的指令吗？
+        stats.countReceived(reply.sospfType);
+        if (reply.sospfType != TYPE_ATTACH || !simulatedIP.equals(reply.srcIP)
+            || !rd.simulatedIPAddress.equals(reply.dstIP)) {
+          System.out.println("Attach failed: unexpected reply.");
+          return;
+        }
 
         if (ATTACH_ACCEPTED.equals(reply.message)) {
           RouterDescription remote = new RouterDescription();
@@ -532,6 +574,9 @@ public class Router {
           System.out.println("received attach request from " + request.srcIP
               + " addressed to " + request.dstIP + " (not me); rejected automatically;");
 
+        } else if (request.weight < 0) {
+          // EDGE CASE: validate incoming requests as well as local commands.
+          System.out.println("Attach rejected: negative link weight.");
         } else if (findLink(request.srcIP) != null) {
           // Simultaneous attach: the other direction was already accepted. The link exists,
           // so just confirm it instead of asking the user again.
@@ -545,7 +590,6 @@ public class Router {
 
         } else {
           System.out.println("received HELLO from " + request.srcIP + ";");
-          System.out.println("Do you accept this request? (Y/N)");
 
           if (askUserYesNo()) {
             RouterDescription remote = new RouterDescription();
@@ -578,7 +622,10 @@ public class Router {
    */
   private boolean askUserYesNo() {
     CompletableFuture<Boolean> decision = new CompletableFuture<>();
-    pendingAttachDecision = decision; 
+    pendingAttachDecision = decision;
+    // EDGE CASE: publish the answer box BEFORE printing the question; otherwise
+    // a fast Y/N may be parsed as a command and leave the requester waiting.
+    System.out.println("Do you accept this request? (Y/N)");
     // it could be checked by other thread. At each iteration of the terminal thread
     // it would check if they receive this box.  Once they recieve they need to handle the request
     // and give an response
@@ -611,24 +658,19 @@ public class Router {
    * new connection to our lsa and also ask neighbor to add this link to theirs LSA)
    */
 
-  // check if there is one neighbor haven't establish the TWO_WAY connection
-  // -> yes -> we need to make a broadcast as our own router has a LSA update
-  // -> no -> we don't need to make broadcast, peers already have our LSD
+  // HELLO establishes neighbors; each start also exchanges the current full LSDB.
   private void processStart() {
     List<Link> links = snapshotLinks();
     if (links.isEmpty()) {
       System.out.println("No attached routers; run attach first.");
       return;
     }
-    boolean lsaChanged = false;
     for (Link link : links) {
-      if (helloHandshake(link)) {
-        lsaChanged =true;
-      }
+      helloHandshake(link);
     }
-    if (lsaChanged) {
-      broadcastLSAUpdate(lsd.deepCopy(), null); // 自己就是改变的router也是发起者所以exception=null
-    }
+    // EDGE CASE: repeated start and joining existing networks must exchange the
+    // full LSDB even if this router's own LSA did not change.
+    broadcastLSAUpdate(lsd.deepCopy(), null);
 
     if (!outgoingAttachRouters.isEmpty()) {
       System.out.println("Note: some attach requests are still waiting for an answer;"
@@ -646,7 +688,7 @@ public class Router {
     boolean result = false;
 
     RouterDescription neighbor = link.router2;
-    try (Socket socket = new Socket(neighbor.processIPAddress, neighbor.processPortNumber);
+    try (Socket socket = openSocket(neighbor.processIPAddress, neighbor.processPortNumber);
          ObjectOutputStream out = openOutput(socket);
          ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
       socket.setSoTimeout(HELLO_TIMEOUT_MS); // setup the terminate time
@@ -658,21 +700,21 @@ public class Router {
 
       // 2nd HELLO (the neighbour's answer)
       SOSPFPacket reply = readPacket(in); 
-      stats.countReceived(TYPE_HELLO); 
-      if (reply.sospfType != TYPE_HELLO || !neighbor.simulatedIPAddress.equals(reply.srcIP)) {
+      stats.countReceived(reply.sospfType);
+      if (reply.sospfType != TYPE_HELLO || !neighbor.simulatedIPAddress.equals(reply.srcIP)
+          || !rd.simulatedIPAddress.equals(reply.dstIP)) {
         System.out.println("start: unexpected reply from " + neighbor.simulatedIPAddress + ";");
         return result;
       }
       System.out.println("received HELLO from " + reply.srcIP + ";");
-      // set own status of this link as TWO_WAY
-      if (advanceNeighborStatus(link, RouterStatus.TWO_WAY)) {
-        result = addNeighborToLSA(link);
-      }
-
       // 3rd HELLO, so the neighbour also reaches TWO_WAY
       out.writeObject(newPacket(TYPE_HELLO, neighbor.simulatedIPAddress));
       out.flush();
       stats.countSent(TYPE_HELLO);  // <----- +1
+      advanceNeighborStatus(link, RouterStatus.TWO_WAY);
+      // EDGE CASE: both ends may start simultaneously. Always try the idempotent
+      // insertion, regardless of which thread advanced this neighbor's status.
+      result = addNeighborToLSA(link);
       return result;
 
     } catch (ConnectException e) {
@@ -700,7 +742,7 @@ public class Router {
                            ObjectInputStream in, ObjectOutputStream out)
       throws IOException, ClassNotFoundException {
     Link link = findLink(first.srcIP); // check if the connection exist
-    if (link == null) {
+    if (link == null || !rd.simulatedIPAddress.equals(first.dstIP)) {
       System.out.println("received HELLO from " + first.srcIP + " but it is not attached; ignored;");
       return;
     }
@@ -714,14 +756,22 @@ public class Router {
 
     socket.setSoTimeout(HELLO_TIMEOUT_MS);
     SOSPFPacket third = readPacket(in);
-    stats.countReceived(TYPE_HELLO);
-    if (third.sospfType != TYPE_HELLO) {
+    stats.countReceived(third.sospfType);
+    if (third.sospfType != TYPE_HELLO || !first.srcIP.equals(third.srcIP)
+        || !rd.simulatedIPAddress.equals(third.dstIP)) {
       System.out.println("start: unexpected packet from " + first.srcIP + ";");
       return;
     }
     System.out.println("received HELLO from " + third.srcIP + ";");
-    if (advanceNeighborStatus(link, RouterStatus.TWO_WAY) && addNeighborToLSA(link)) {
+    advanceNeighborStatus(link, RouterStatus.TWO_WAY);
+    if (addNeighborToLSA(link)) {
       broadcastLSAUpdate(lsd.deepCopy(), null);
+    } else {
+      // EDGE CASE: repeated HELLO still exchanges the full database. Equal
+      // sequence numbers stop these snapshots from flooding indefinitely.
+      SOSPFPacket update = newPacket(TYPE_LSU, link.router2.simulatedIPAddress);
+      update.lsaArray = lsd.deepCopy();
+      sendOneWayMessage(link.router2, update);
     }
   }
 
@@ -771,9 +821,10 @@ public class Router {
    */
   private void processDetect(String destinationIP) {
     String path = lsd.getShortestPath(destinationIP);
-    if (path == null) {System.out.println("NO path");}
-    else {
-      System.out.println(path);
+    if (path == null) {
+      System.out.println("Path not found");
+    } else {
+      System.out.println("Path found: " + path);
     }
   }
 
@@ -828,23 +879,26 @@ public class Router {
    * <p/>
    * For each intermediate router on the shortest path (excluding the source and destination),
    * the router window should print:
-   * "Forwarding packet from <Source IP> to <Destination IP>"
+   * "Forwarding message from <Source IP> to <Destination IP>"
    * <p/>
    * When the destination router receives the message, the router window should print:
-   * "Received message from <Source IP>:"
-   * "<Message>"
+   * "Received message from <Source IP>;"
+   * "Message: <Message>"
    *
    * @param destinationIP the simulated IP address of the destination router
    * @param message the message content to send
    */ // <-------------------------------------PA2
   private void processSend(String destinationIP, String message) {
     if (destinationIP.equals(rd.simulatedIPAddress)) {
-      System.out.println("Send a message to yourself?");
+      // EDGE CASE: local delivery needs no socket or network packet count.
+      System.out.println("Sending message to " + destinationIP);
+      System.out.println("Received message from " + rd.simulatedIPAddress + ";");
+      System.out.println("Message: " + message);
       return;
     }
     Link link = nextHopLink(destinationIP);
     if (link  == null) {
-      System.out.println("No path");
+      System.out.println("Path not found");
       return;
     }
     SOSPFPacket packet = newPacket(TYPE_APP_MESSAGE, destinationIP);
@@ -858,11 +912,11 @@ public class Router {
    * This method should be called when a router receives a SOSPFPacket with sospfType = 2 (Application Message).
    * <p/>
    * If this router is the destination (packet.dstIP equals this router's simulatedIPAddress):
-   * - Print "Received message from <Source IP>:"
-   * - Print the message content
+   * - Print "Received message from <Source IP>;"
+   * - Print "Message: <Message>"
    * <p/>
    * If this router is an intermediate router:
-   * - Print "Forwarding packet from <Source IP> to <Destination IP>"
+   * - Print "Forwarding message from <Source IP> to <Destination IP>"
    * - Forward the packet to the next hop on the shortest path to the destination
    * - Do NOT print or inspect the message payload
    *
@@ -871,23 +925,22 @@ public class Router {
   private void handleApplicationMessage(socs.network.message.SOSPFPacket packet) {
     // router is the destination
     if (packet.dstIP.equals(rd.simulatedIPAddress)) {
-      System.out.println("Received message from " + packet.srcIP + ":");
-      System.out.println(packet.message);
+      System.out.println("Received message from " + packet.srcIP + ";");
+      System.out.println("Message: " + packet.message);
       return;
     }
 
     // If the router not the destination 
-    System.out.println("Forwarding packet from "+ packet.srcIP + " to " + packet.dstIP);
     Link nextLink = nextHopLink(packet.dstIP);
     if (nextLink == null) {
-      System.out.println("NO path to " + packet.dstIP);
+      System.out.println("Path not found");
       return;
     }
-    System.out.println("Next Hop: " + nextLink.router2.simulatedIPAddress);
-    SOSPFPacket nextPacket = newPacket(TYPE_APP_MESSAGE, packet.dstIP);
-    nextPacket.srcIP = packet.srcIP;
-    nextPacket.message = packet.message; // 为什么不能用之前的packet这里啥也没变啊
-    sendOneWayMessage(nextLink.router2, nextPacket);
+    System.out.println("Forwarding message from " + packet.srcIP + " to " + packet.dstIP);
+    System.out.println("Next hop: " + nextLink.router2.simulatedIPAddress);
+    // EDGE CASE: across multiple hops, preserve the original source and payload.
+    // The intermediate router only uses dstIP to choose its next link.
+    sendOneWayMessage(nextLink.router2, packet);
   }
 
   // =======================================================================================
@@ -941,61 +994,96 @@ public class Router {
     }
   }
 
-  /** Parses one command line and runs the matching process* method. */
-  private void runCommand(String command) {
-    if (command.startsWith("detect ")) {
-      String[] cmdLine = command.split(" ");
-      processDetect(cmdLine[1]);
-    } else if (command.startsWith("disconnect ")) {
-      String[] cmdLine = command.split(" ");
-      processDisconnect(Short.parseShort(cmdLine[1]));
-    } else if (command.equals("quit")) {
-      processQuit();
-    } else if (command.equals("stats")) {
-      System.out.println(stats.reportMessageCount());
-    }else if (command.startsWith("attach ")) {
-      // attach [Process IP] [Process Port] [Simulated IP] [Link Weight]
-      String[] cmdLine = command.split(" ");
-      String processIP = cmdLine[1];
-      short processPort = Short.parseShort(cmdLine[2]);
-      String simulatedIP = cmdLine[3];
-      short weight = Short.parseShort(cmdLine[4]);
-      // Runs off the terminal thread: it blocks until the remote user answers Y/N, and this
-      // terminal must stay free to answer the remote router's own request in the meantime.
-      Thread attach = new Thread(
-          () -> processAttach(processIP, processPort, simulatedIP, weight),
-          "attach-" + simulatedIP);
-      attach.setDaemon(true);
-      attach.start();
-    } else if (command.equals("start")) {
-      processStart();
-    } else if (command.equals("lsd")) {
-      System.out.println(lsd);
-    }else if (command.startsWith("connect ")) {
-      String[] cmdLine = command.split(" ");
-      processConnect(cmdLine[1], Short.parseShort(cmdLine[2]),
-          cmdLine[3], Short.parseShort(cmdLine[4]));
-    } else if (command.equals("neighbors")) {
-      processNeighbors();
-    } else if (command.startsWith("send ")) {
-      // send [Destination IP] [Message]
-      String[] cmdLine = command.split(" ", 3);
-      if (cmdLine.length >= 3) {
-        processSend(cmdLine[1], cmdLine[2]);
-      } else {
-        System.out.println("Usage: send [Destination IP] [Message]");
-      }
-    } else if (command.startsWith("update ")) {
-      // update [port_number] [new_weight]
-      String[] cmdLine = command.split(" ");
-      if (cmdLine.length >= 3) {
-        processUpdate(Short.parseShort(cmdLine[1]), Short.parseShort(cmdLine[2]));
-      } else {
-        System.out.println("Usage: update [port_number] [new_weight]");
-      }
-    } else {
-      System.out.println("Unknown command: " + command);
+  private boolean hasArgumentCount(String[] arguments, int expected, String usage) {
+    if (arguments.length == expected) {
+      return true;
     }
+    System.out.println("Usage: " + usage);
+    return false;
   }
 
+  /** Parses one command line and runs the matching process* method. */
+  private void runCommand(String command) {
+    command = command.trim();
+    if (command.isEmpty()) {
+      return;
+    }
+    // EDGE CASE: consecutive spaces or tabs are valid command separators.
+    // Check argument counts before indexing; an incomplete command must not crash.
+    String[] arguments = command.split("\\s+");
+    switch (arguments[0]) {
+      case "detect":
+        if (hasArgumentCount(arguments, 2, "detect [Destination IP]")) {
+          processDetect(arguments[1]);
+        }
+        break;
+      case "disconnect":
+        if (hasArgumentCount(arguments, 2, "disconnect [Port Number]")) {
+          processDisconnect(Short.parseShort(arguments[1]));
+        }
+        break;
+      case "quit":
+        if (hasArgumentCount(arguments, 1, "quit")) {
+          processQuit();
+        }
+        break;
+      case "stats":
+        if (hasArgumentCount(arguments, 1, "stats")) {
+          System.out.println(stats.reportMessageCount());
+        }
+        break;
+      case "attach":
+        if (hasArgumentCount(arguments, 5,
+            "attach [Process IP] [Process Port] [Simulated IP] [Link Weight]")) {
+          String processIP = arguments[1];
+          short processPort = Short.parseShort(arguments[2]);
+          String simulatedIP = arguments[3];
+          short weight = Short.parseShort(arguments[4]);
+          // Human approval must not block this terminal from handling incoming Y/N.
+          Thread attach = new Thread(
+              () -> processAttach(processIP, processPort, simulatedIP, weight),
+              "attach-" + simulatedIP);
+          attach.setDaemon(true);
+          attach.start();
+        }
+        break;
+      case "start":
+        if (hasArgumentCount(arguments, 1, "start")) {
+          processStart();
+        }
+        break;
+      case "lsd":
+        if (hasArgumentCount(arguments, 1, "lsd")) {
+          System.out.println(lsd);
+        }
+        break;
+      case "connect":
+        if (hasArgumentCount(arguments, 5,
+            "connect [Process IP] [Process Port] [Simulated IP] [Link Weight]")) {
+          processConnect(arguments[1], Short.parseShort(arguments[2]),
+              arguments[3], Short.parseShort(arguments[4]));
+        }
+        break;
+      case "neighbors":
+        if (hasArgumentCount(arguments, 1, "neighbors")) {
+          processNeighbors();
+        }
+        break;
+      case "send":
+        // EDGE CASE: tokenize only the command and destination; preserve spaces
+        // and tabs inside the application payload rather than rebuilding the text.
+        String[] messageArguments = command.split("\\s+", 3);
+        if (hasArgumentCount(messageArguments, 3, "send [Destination IP] [Message]")) {
+          processSend(messageArguments[1], messageArguments[2]);
+        }
+        break;
+      case "update":
+        if (hasArgumentCount(arguments, 3, "update [Port Number] [New Weight]")) {
+          processUpdate(Short.parseShort(arguments[1]), Short.parseShort(arguments[2]));
+        }
+        break;
+      default:
+        System.out.println("Unknown command: " + command);
+    }
+  }
 }

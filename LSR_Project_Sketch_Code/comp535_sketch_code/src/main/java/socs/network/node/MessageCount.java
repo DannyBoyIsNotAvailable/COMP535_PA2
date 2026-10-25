@@ -8,7 +8,9 @@ package socs.network.node;
 
 public class MessageCount {
 
-    private Object count_obj;
+    // EDGE CASE: concurrent handlers and stats share one initialized lock.
+    // A null lock would crash on the very first packet or stats command.
+    private final Object count_obj = new Object();
     
     private final String[] TYPE_MESSAGE = {"HELLO", "LSAUPDATE", "APP_MESSAGE", "ATTACH"};
     private int[] received = new int [TYPE_MESSAGE.length]; // each entry count the number of certain message it received

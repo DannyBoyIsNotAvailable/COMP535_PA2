@@ -1,0 +1,4 @@
+# Maven and manual Java build outputs
+**/target/
+**/out/
+*.class

@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Vector;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.Queue;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.Set;
@@ -42,8 +41,8 @@ public class LinkStateDatabase {
 
 private static class PQEntry {
   String node;
-  int distance;
-  PQEntry(String node, int distance) {
+  long distance;
+  PQEntry(String node, long distance) {
     this.node = node;
     this.distance = distance;
   }
@@ -55,14 +54,14 @@ private static class PQEntry {
  * this will cover all the edges for all routers
  */
 
-// NOTE: linkStateID是自己的 linkID是对方的
+// NOTE: linkStateID-current router, 是自己的 linkID-target router, 是对方的
 private Map<String, Map<String, Integer>> constructGraph() {
   Map<String, Map<String, Integer>> graph = new HashMap<>();
   for (LSA lsa : _store.values()) { 
     Map<String, Integer> edges = new HashMap<>();
 
     for (LinkDescription ld : lsa.links) {
-      if (ld.linkID.equals(lsa.linkStateID)) continue; // 会存一个自连接
+      if (ld.linkID.equals(lsa.linkStateID)) continue; // self 会存一个自连接
       edges.put(ld.linkID, ld.weight);
     }
     graph.put(lsa.linkStateID, edges);
@@ -76,16 +75,19 @@ private Map<String, Map<String, Integer>> constructGraph() {
  * return the Path object
  */
 public synchronized Path findShortestPathTo(String destIP) {
+  // EDGE CASE: unknown destinations return null; the source itself has a
+  // zero-edge path. Use long distances so a sum of valid weights cannot wrap int.
+  if (destIP == null) return null;
   String src = rd.simulatedIPAddress;
   Map<String, Map<String, Integer>> graph = constructGraph();
 
-  Map<String, Integer> dist = new HashMap<>(); // d[v] initialize as inf
+  Map<String, Long> dist = new HashMap<>(); // d[v] initialize as inf
   Map<String, String> prev = new HashMap<>();  // prev[v] nil at first
   Set<String> done = new HashSet<>();  // routers with distance been fixed (already the best)
-  PriorityQueue<PQEntry> queue = new PriorityQueue<>((a,b) -> Integer.compare(a.distance, b.distance));
+  PriorityQueue<PQEntry> queue = new PriorityQueue<>((a,b) -> Long.compare(a.distance, b.distance));
 
   // Initialize the dist of the src as 0, others as infinity === null
-  dist.put(src, 0);
+  dist.put(src, 0L);
   queue.add(new PQEntry(src, 0));
 
   while (!queue.isEmpty()) {
@@ -161,7 +163,6 @@ public synchronized Path findShortestPathTo(String destIP) {
    * @return the shortest path as a string, or null if no path exists
    */
   String getShortestPath(String destinationIP) {  // <-------------
-    //TODO: fill the implementation here
     Path path = findShortestPathTo(destinationIP);
     if (path == null) return null;
     StringBuilder sb = new StringBuilder(path.nodes.get(0));
@@ -186,7 +187,10 @@ public synchronized Path findShortestPathTo(String destIP) {
   }
 
 
-  public String toString() {
+  // EDGE CASE: lsd can be printed while a connection thread merges an update.
+  // Use the same monitor as merge/deepCopy to avoid concurrent iteration failures.
+  @Override
+  public synchronized String toString() {
     StringBuilder sb = new StringBuilder();
     for (LSA lsa: _store.values()) {
       sb.append(lsa.linkStateID).append("(" + lsa.lsaSeqNumber + ")").append(":\t");
@@ -207,6 +211,8 @@ public synchronized Path findShortestPathTo(String destIP) {
    * it's link description so here we do the same thing (use neighbor's simulatedIP to represent the new ld).
    */
   public synchronized boolean addLinkToLSA(String neighborSimuIP, int port, int weight) {
+    // EDGE CASE: only advertise installed neighbors with nonnegative costs.
+    if (neighborSimuIP == null || port < 0 || weight < 0) return false;
     LSA ownLSA = _store.get(rd.simulatedIPAddress); // use the router's own simulatedIP to get it's own LSA
     for (LinkDescription ld : ownLSA.links) {
       if (ld.linkID.equals(neighborSimuIP)) {
@@ -231,24 +237,37 @@ public synchronized Path findShortestPathTo(String destIP) {
    * We will add those new or new version LSA into the _store
    * 
    * 
-   * AI advice1: check if the incomingLSA == null
-   * AI advice2: you can just skip your own LSA
+   * EDGE CASE: null updates, own LSAs, and old/equal sequence numbers are ignored.
+   * Only accepted updates are returned for flooding, so rings terminate naturally.
    */
   public synchronized List<LSA> merge(List<LSA> newLSAs) {
     List<LSA> result = new ArrayList<>();
+    if (newLSAs == null) return result;
     for (LSA incomingLSA : newLSAs) {
-      if (incomingLSA == null || incomingLSA.linkStateID == null) {
+      if (!validLSA(incomingLSA)
+          || rd.simulatedIPAddress.equals(incomingLSA.linkStateID)) {
         continue;
       }
-      if (!_store.containsKey(incomingLSA.linkStateID) ||
-          _store.get(incomingLSA.linkStateID).lsaSeqNumber < incomingLSA.lsaSeqNumber) {
-         // That means this LSA should be stored
-        result.add(incomingLSA);
-        _store.put(incomingLSA.linkStateID, incomingLSA);
+      LSA current = _store.get(incomingLSA.linkStateID);
+      if (current == null || current.lsaSeqNumber < incomingLSA.lsaSeqNumber) {
+        // EDGE CASE: neither the incoming packet nor the returned flood list may
+        // share mutable LSA/LinkDescription objects with the live database.
+        LSA stored = copy(incomingLSA);
+        _store.put(stored.linkStateID, stored);
+        result.add(copy(stored));
       }
     }
-    return result; // For checking if the merged list is empty or not
-    // then we could determin wheather or not  we need to make a broadcast for this update.
+    return result;
+  }
+
+  private boolean validLSA(LSA lsa) {
+    if (lsa == null || lsa.linkStateID == null || lsa.links == null) return false;
+    for (LinkDescription ld : lsa.links) {
+      // EDGE CASE: a malformed/negative-cost LSA must not break Dijkstra.
+      // Reject the whole LSA instead of installing only part of its topology.
+      if (ld == null || ld.linkID == null || ld.weight < 0) return false;
+    }
+    return true;
   }
 
   /**
@@ -257,7 +276,7 @@ public synchronized Path findShortestPathTo(String destIP) {
    * 2: Another routine is we take the lock during sending LSAs
    * at this case we don't need to do any copy
    * 
-   * => Why we choose 2: the problem is the sending process might be time-consuming
+   * => Why we choose 1: the problem is the sending process might be time-consuming
    * that means we need to hold the lock for quite long time and other thread that
    * need to update the _src might need to wait for the lock ...
    * Return type Vector<> : this is defined inside SOSPFPacket
@@ -271,7 +290,7 @@ public synchronized Path findShortestPathTo(String destIP) {
   }
 
   // deep copy lsa, create the new LinkDescription
-  public LSA copy(LSA lsa) {
+  private LSA copy(LSA lsa) {
     LSA new_lsa = new LSA();
     new_lsa.linkStateID = lsa.linkStateID;
     new_lsa.lsaSeqNumber = lsa.lsaSeqNumber;
