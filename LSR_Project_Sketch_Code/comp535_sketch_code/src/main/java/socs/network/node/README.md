@@ -1,6 +1,6 @@
 # PA2 Implementation and Running Notes
 
-This is the group's implementation README. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/` (`LSR_Project_Sketch_Code/comp535_sketch_code` in the repository). For the supplied starter instructions, see the [project README](../../../../../../README.md).
+This is the group's implementation README. Run all commands below from the Java project directory containing `pom.xml`, `src/`, and `conf/`.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ This produces `target/COMP535-1.0-SNAPSHOT-jar-with-dependencies.jar`.
 
 ## Start five routers
 
-Open five VSCode terminals in the Java project directory. Run one command per terminal:
+Open five terminals in the Java project directory. Run one command per terminal:
 
 ```text
 java -jar target/COMP535-1.0-SNAPSHOT-jar-with-dependencies.jar conf/router1.conf
