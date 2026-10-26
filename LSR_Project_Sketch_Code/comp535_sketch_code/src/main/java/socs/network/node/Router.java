@@ -809,7 +809,7 @@ public class Router {
   }
 
   // =======================================================================================
-  // Commands for later assignments (unchanged from the starter code)
+  // PA2: detect computes a path from the current LSDB.
   // =======================================================================================
 
   /**
@@ -834,6 +834,7 @@ public class Router {
    *
    * @param portNumber the port number which the link attaches at
    */
+  // Dynamic-topology placeholder; not listed among the PA2 requirements.
   private void processDisconnect(short portNumber) {
 
   }
@@ -890,10 +891,9 @@ public class Router {
    */ // <-------------------------------------PA2
   private void processSend(String destinationIP, String message) {
     if (destinationIP.equals(rd.simulatedIPAddress)) {
-      // EDGE CASE: local delivery needs no socket or network packet count.
-      System.out.println("Sending message to " + destinationIP);
-      System.out.println("Received message from " + rd.simulatedIPAddress + ";");
-      System.out.println("Message: " + message);
+      // EDGE CASE: PA2 clarification requires rejecting this router as destination.
+      // Return before creating a packet, printing its payload, or updating counters.
+      System.out.println("Cannot send to yourself.");
       return;
     }
     Link link = nextHopLink(destinationIP);

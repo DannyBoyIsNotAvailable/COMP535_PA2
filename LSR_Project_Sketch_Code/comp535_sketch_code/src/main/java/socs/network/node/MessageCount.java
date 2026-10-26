@@ -37,9 +37,9 @@ public class MessageCount {
         synchronized(count_obj) {
             StringBuilder sb = new StringBuilder();
             for (int i=0; i<TYPE_MESSAGE.length; i++) {
-                sb.append(TYPE_MESSAGE[i]).append(" Sent: ").append(sent[i]);
+                sb.append(TYPE_MESSAGE[i]).append(" sent: ").append(sent[i]);
                 sb.append("\n");
-                sb.append(TYPE_MESSAGE[i]).append(" Received: ").append(received[i]);
+                sb.append(TYPE_MESSAGE[i]).append(" received: ").append(received[i]);
                 sb.append("\n");
             }
             return sb.toString();
