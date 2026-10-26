@@ -809,7 +809,7 @@ public class Router {
   }
 
   // =======================================================================================
-  // Commands for later assignments (unchanged from the starter code)
+  // PA2: detect computes a path from the current LSDB.
   // =======================================================================================
 
   /**
@@ -834,6 +834,7 @@ public class Router {
    *
    * @param portNumber the port number which the link attaches at
    */
+  // Dynamic-topology placeholder; not listed among the PA2 requirements.
   private void processDisconnect(short portNumber) {
 
   }
